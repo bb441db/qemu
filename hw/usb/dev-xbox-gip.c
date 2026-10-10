@@ -39,6 +39,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(USBXboxGIPState, USB_XBOX_GIP)
 #define UFU_MAX_WRITE     0x1000u
 #define UFU_MAX_MSG       (8 + UFU_MAX_WRITE)
 #define UFU_MAX_COMPONENT 4
+#define UFU_PARTITION_MAGIC 0x1a253a45u
+
+/* Partition sizes a physical MERL controller (5.23.6.0) reports. */
+static const uint32_t ufu_partition_sizes[UFU_MAX_COMPONENT + 1] = {
+    [1] = 0x5000, [2] = 0x22000, [3] = 0x7e000, [4] = 0x7e000,
+};
 
 enum {
     UFU_GET_INFO = 0x00,
@@ -53,6 +59,7 @@ enum {
     UFU_OK = 0,
     UFU_INVALID_ARGUMENT = 1,
     UFU_UNKNOWN_COMPONENT = 2,
+    UFU_MUST_RESET = 3,
     UFU_INVALID_RANGE = 5,
     UFU_UPDATE_NOT_IN_PROGRESS = 9,
     UFU_PROTOCOL_ERROR = 13,
@@ -67,9 +74,22 @@ struct USBXboxGIPState {
     USBDevice dev;
     USBEndpoint *intr_in;
     QEMUTimer *hello_timer;
-    /* Simulates the reboot into new firmware after a completed update. */
+    /* Simulates the controller restarting on USB after a reset. */
     QEMUTimer *reboot_timer;
     bool reboot_detached;
+    /*
+     * After a restart the physical controller sends a single Hello. If the
+     * host does not answer it with Start in time, the controller ignores the
+     * host until it is unplugged; here, until QEMU restarts.
+     */
+    QEMUTimer *stuck_timer;
+    bool rebooted;
+    bool hello_once;
+    bool awaiting_start;
+    bool stuck;
+    /* strict-hello: get stuck instead of only warning. */
+    bool strict_hello;
+    int64_t hello_read_ms;
     GIPFrame tx[GIP_QUEUE_DEPTH];
     unsigned int tx_head;
     unsigned int tx_count;
@@ -93,7 +113,8 @@ struct USBXboxGIPState {
     uint8_t *ufu_flash;
     uint16_t ufu_versions[UFU_MAX_COMPONENT + 1][4];
     bool ufu_in_progress;
-    bool ufu_reboot_pending;
+    /* BeginUpdate for component 4 already asked for its restart. */
+    bool ufu_begin4_reset_done;
     uint32_t ufu_component;
     uint32_t ufu_address;
     uint32_t ufu_size;
@@ -347,15 +368,39 @@ static void xbox_gip_hello(void *opaque)
     stw_le_p(&hello[20], s->fw_build);
     stw_le_p(&hello[22], s->fw_revision);
 
-    if (s->state == GIP_ARRIVAL) {
+    if (s->state == GIP_ARRIVAL && !s->awaiting_start && !s->stuck) {
         hello[2] = s->hello_sequence++;
         if (s->hello_sequence == 0) {
             s->hello_sequence = 1;
         }
         xbox_gip_enqueue(s, hello, sizeof(hello));
+        if (s->hello_once) {
+            /*
+             * After a restart: one Hello, then wait for Start. The deadline
+             * starts once the host has read the Hello (xbox_gip_handle_data).
+             */
+            s->hello_once = false;
+            s->awaiting_start = true;
+            return;
+        }
     }
     timer_mod(s->hello_timer,
               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 500);
+}
+
+static void xbox_gip_stuck(void *opaque)
+{
+    USBXboxGIPState *s = opaque;
+
+    if (!s->strict_hello) {
+        fprintf(stderr, "Xbox GIP Hello after restart not answered after 10 s "
+                "(continuing; strict-hello=on would stop here)\n");
+        return;
+    }
+    s->awaiting_start = false;
+    s->stuck = true;
+    fprintf(stderr, "Xbox GIP Hello after restart was not answered; "
+            "ignoring the host from now on (restart QEMU to recover)\n");
 }
 
 static bool xbox_gip_is_metadata_ack(const uint8_t *buf, size_t len)
@@ -512,6 +557,10 @@ static void xbox_gip_ufu_command(USBXboxGIPState *s, const uint8_t *req,
             for (int i = 0; i < 4; i++) {
                 stw_le_p(&rsp[6 + i * 2], s->ufu_versions[id][i]);
             }
+            /* Optional tail: magic, 4 unknown bytes, partition size. */
+            stl_le_p(&rsp[14], UFU_PARTITION_MAGIC);
+            stl_le_p(&rsp[22], ufu_partition_sizes[id]);
+            rsp_len = 26;
         }
         fprintf(stderr, "Xbox UFU GetVersion component=%u status=%u\n",
                 id, rsp[1]);
@@ -528,7 +577,14 @@ static void xbox_gip_ufu_command(USBXboxGIPState *s, const uint8_t *req,
             rsp[1] = UFU_UNKNOWN_COMPONENT;
         } else if (!xbox_gip_ufu_range_ok(address, size)) {
             rsp[1] = UFU_INVALID_RANGE;
+        } else if (id == 4 && !s->ufu_begin4_reset_done) {
+            /* The physical controller restarts before writing component 4. */
+            s->ufu_begin4_reset_done = true;
+            rsp[1] = UFU_MUST_RESET;
         } else {
+            if (id == 4) {
+                s->ufu_begin4_reset_done = false;
+            }
             s->ufu_in_progress = true;
             s->ufu_component = id;
             s->ufu_address = address;
@@ -589,7 +645,12 @@ static void xbox_gip_ufu_command(USBXboxGIPState *s, const uint8_t *req,
             rsp[1] = UFU_UPDATE_NOT_IN_PROGRESS;
         } else {
             s->ufu_in_progress = false;
-            s->ufu_reboot_pending = true;
+            /*
+             * The physical controller answers MustReset for every component;
+             * the host then resets it and it restarts on USB before the
+             * update continues.
+             */
+            rsp[1] = UFU_MUST_RESET;
             memcpy(s->ufu_versions[s->ufu_component], s->ufu_version,
                    sizeof(s->ufu_version));
             xbox_gip_ufu_dump(s);
@@ -601,6 +662,9 @@ static void xbox_gip_ufu_command(USBXboxGIPState *s, const uint8_t *req,
                 s->fw_revision = s->ufu_version[3];
                 stw_le_p(&s->metadata_first[45], s->fw_major);
                 stw_le_p(&s->metadata_first[47], s->fw_minor);
+                /* Seen by the host when the device re-enumerates. */
+                s->desc.id.bcdDevice = ((s->fw_major & 0xff) << 8) |
+                                       (s->fw_minor & 0xff);
             }
         }
         fprintf(stderr, "Xbox UFU CompleteUpdate component=%u status=%u\n",
@@ -675,6 +739,7 @@ static void xbox_gip_reboot(void *opaque)
         return;
     }
     s->reboot_detached = false;
+    s->rebooted = true;
     fprintf(stderr, "Xbox GIP USB attach\n");
     usb_device_attach(&s->dev, &err);
     if (err) {
@@ -685,8 +750,16 @@ static void xbox_gip_reboot(void *opaque)
 static void xbox_gip_host_packet(USBXboxGIPState *s,
                                  const uint8_t *buf, size_t len)
 {
-    if (len < 4) {
+    if (len < 4 || s->stuck) {
         return;
+    }
+    if (s->awaiting_start && s->hello_read_ms) {
+        /* Record how the host answers a restarted controller. */
+        fprintf(stderr, "Xbox GIP first host message after restart Hello, "
+                "%" PRId64 " ms after it was read: %02x %02x %02x %02x\n",
+                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) - s->hello_read_ms,
+                buf[0], buf[1], buf[2], buf[3]);
+        s->hello_read_ms = 0;
     }
     if (buf[1] & GIP_OPT_ACK && buf[0] != 0x01) {
         xbox_gip_ack(s, buf, len);
@@ -719,6 +792,10 @@ static void xbox_gip_host_packet(USBXboxGIPState *s,
         switch (buf[4]) {
         case 0x00:
             s->state = GIP_ACTIVE;
+            if (s->awaiting_start) {
+                s->awaiting_start = false;
+                timer_del(s->stuck_timer);
+            }
             break;
         case 0x01:
             s->state = GIP_IDLE;
@@ -729,28 +806,16 @@ static void xbox_gip_host_packet(USBXboxGIPState *s,
             break;
         case 0x07:
             /*
-             * The Windows updater treats a status with power bits 6-7 clear
-             * as the disconnect that follows its reset, then waits for a
-             * Hello with the same device ID.
+             * Reset: the physical controller sends a power-off status (the
+             * Windows updater treats it as the disconnect), drops off USB,
+             * re-enumerates and sends a single Hello.
              */
             xbox_gip_send_power_off(s);
-            if (s->ufu_reboot_pending) {
-                /*
-                 * A real controller boots its new firmware here and drops
-                 * off USB.  Windows ends the update session after the reset
-                 * and only finds the device again once it re-enumerates.
-                 */
-                s->ufu_reboot_pending = false;
-                s->state = GIP_OFF;
-                fprintf(stderr, "Xbox UFU rebooting into new firmware\n");
-                timer_mod(s->reboot_timer,
-                          qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
-                break;
-            }
-            s->state = GIP_ARRIVAL;
-            s->hello_sequence = 0x02;
-            timer_mod(s->hello_timer,
-                      qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
+            s->state = GIP_OFF;
+            fprintf(stderr, "Xbox GIP restarting on USB\n");
+            /* The physical controller disconnects 1-3.6 s later. */
+            timer_mod(s->reboot_timer,
+                      qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1500);
             break;
         default:
             break;
@@ -805,6 +870,12 @@ static void xbox_gip_handle_data(USBDevice *dev, USBPacket *p)
         {
             size_t len = MIN(frame->len, p->iov.size);
             usb_packet_copy(p, frame->data, len);
+            if (frame->data[0] == 0x02 && s->awaiting_start &&
+                !timer_pending(s->stuck_timer)) {
+                /* The host has the restart Hello; it must answer in time. */
+                s->hello_read_ms = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+                timer_mod(s->stuck_timer, s->hello_read_ms + 10000);
+            }
             /* Skip ACKs of UFU messages; the UFU log lines cover them. */
             if (!(frame->data[0] == 0x01 && frame->data[5] == 0x0c)) {
                 xbox_gip_log_packet("IN", frame->data, len);
@@ -837,6 +908,16 @@ static void xbox_gip_reset(USBDevice *dev)
     s->status_sequence = 0x01;
     s->metadata_ack_phase = 0;
     s->state = GIP_ARRIVAL;
+    if (s->rebooted || s->awaiting_start) {
+        /*
+         * After a restart, and again on every bus reset until the Hello is
+         * answered: the reset clears the IN queue, so announce again.
+         */
+        s->rebooted = false;
+        s->awaiting_start = false;
+        s->hello_once = true;
+        timer_del(s->stuck_timer);
+    }
     timer_mod(s->hello_timer,
               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
 }
@@ -875,6 +956,7 @@ static void xbox_gip_realize(USBDevice *dev, Error **errp)
     s->intr_in = usb_ep_get(dev, USB_TOKEN_IN, GIP_EP_IN);
     s->hello_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, xbox_gip_hello, s);
     s->reboot_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, xbox_gip_reboot, s);
+    s->stuck_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, xbox_gip_stuck, s);
     s->hello_sequence = 0x02;
     s->status_sequence = 0x01;
     s->state = GIP_ARRIVAL;
@@ -887,6 +969,7 @@ static void xbox_gip_unrealize(USBDevice *dev)
     USBXboxGIPState *s = USB_XBOX_GIP(dev);
     timer_free(s->hello_timer);
     timer_free(s->reboot_timer);
+    timer_free(s->stuck_timer);
     g_free(s->ufu_flash);
 }
 
@@ -901,6 +984,7 @@ static const Property xbox_gip_properties[] = {
     DEFINE_PROP_UINT16("fw-build", USBXboxGIPState, fw_build, 6),
     DEFINE_PROP_UINT16("fw-revision", USBXboxGIPState, fw_revision, 0),
     DEFINE_PROP_STRING("fw-dump-dir", USBXboxGIPState, fw_dump_dir),
+    DEFINE_PROP_BOOL("strict-hello", USBXboxGIPState, strict_hello, false),
 };
 
 static void xbox_gip_class_init(ObjectClass *klass, const void *data)
